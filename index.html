@@ -202,6 +202,12 @@
     font-size:14px; font-family:inherit; background:#FAFBFC;
   }
   .field input:focus{ outline:none; border-color:var(--navy); background:#fff; }
+  .field select{
+    width:100%; padding:12px 14px; border:1.5px solid var(--line); border-radius:12px;
+    font-size:14px; font-family:inherit; background:#FAFBFC; -webkit-appearance:none; appearance:none;
+  }
+  .field select:focus{ outline:none; border-color:var(--navy); background:#fff; }
+  .field-hint{ font-size:11px; color:var(--text-muted); margin-top:6px; line-height:1.6; font-weight:500; }
   .sheet-btn{
     width:100%; padding:13px; border:none; border-radius:12px; font-weight:800; font-size:14px;
     cursor:pointer; margin-bottom:10px;
@@ -320,8 +326,21 @@
 <!-- Settings sheet -->
 <div class="modal" id="settingsModal">
   <div class="sheet">
-    <h2>同期設定(Supabase)</h2>
-    <div class="desc">設定するとiPhone・iPad・Androidの間で文字起こし記録が同期されます。未設定でも端末内保存だけで全機能が使えます。</div>
+    <h2>設定</h2>
+    <div class="desc">文字起こしの精度と、デバイス間同期(Supabase)の設定です。</div>
+
+    <div class="field">
+      <label>確定版の精度モデル</label>
+      <select id="modelSelect">
+        <option value="base">軽量(base・約150MB)</option>
+        <option value="small">標準(small・約250MB / 推奨)</option>
+        <option value="medium">高精度(medium・約800MB)</option>
+        <option value="turbo">最高精度(large-v3-turbo・GPU / ハイエンド端末向け)</option>
+      </select>
+      <div class="field-hint">アプリやブラウザが落ちる場合は軽いモデルを選んでください。変更は次回の録音開始時に反映されます。iPhoneは「標準」推奨です。</div>
+    </div>
+
+    <div class="sheet-divider"></div>
 
     <div class="auth-state" id="authState">未設定</div>
 
@@ -372,6 +391,16 @@ const CHUNK_TARGET_SECONDS = 300; // 5 minutes per final chunk
 const TINY_MODEL = 'Xenova/whisper-tiny';
 const TURBO_MODEL = 'onnx-community/whisper-large-v3-turbo';
 const FALLBACK_MODEL = 'Xenova/whisper-small';
+const MODEL_CHOICES = {
+  base:  { id: 'Xenova/whisper-base',   label: 'base' },
+  small: { id: 'Xenova/whisper-small',  label: 'small' },
+  medium:{ id: 'Xenova/whisper-medium', label: 'medium' },
+  turbo: { id: TURBO_MODEL, label: 'large-v3-turbo', webgpu: true }
+};
+function getModelPref(){
+  const v = localStorage.getItem('echo_model_pref');
+  return MODEL_CHOICES[v] ? v : 'small';
+}
 const RMS_SILENCE = 0.0045;       // below this = treated as silence for realtime
 const SB_TABLE = 'echo_captures';
 const DEVICE = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
@@ -704,11 +733,17 @@ function openSettings(){
   const cfg = loadCfg();
   document.getElementById('sbUrl').value = (cfg && cfg.url) || '';
   document.getElementById('sbKey').value = (cfg && cfg.key) || '';
+  document.getElementById('modelSelect').value = getModelPref();
   refreshSyncStatus();
   settingsModal.classList.add('show');
 }
 document.getElementById('settingsBtn').addEventListener('click', openSettings);
 loginBadgeEl.addEventListener('click', openSettings);
+document.getElementById('modelSelect').addEventListener('change', (e)=>{
+  localStorage.setItem('echo_model_pref', e.target.value);
+  if(!isRecording){ largePipe = null; loadedFinalKey = null; }
+  showToast('モデル設定を保存しました(次回の録音開始時に反映)');
+});
 document.getElementById('closeSettingsBtn').addEventListener('click', ()=> settingsModal.classList.remove('show'));
 settingsModal.addEventListener('click', (e)=>{ if(e.target === settingsModal) settingsModal.classList.remove('show'); });
 
@@ -790,10 +825,13 @@ function setFormatTabs(fmt){
 
 // ---------- Model loading ----------
 let finalModelLabel = '';
+let loadedFinalKey = null;
 function modelProgress(p){
   if(p.status==='progress'){ overlayPct.textContent = Math.round(p.progress||0)+'%'; }
 }
 async function ensureModels(){
+  const prefKey = getModelPref();
+  if(largePipe && loadedFinalKey !== prefKey && !isRecording){ largePipe = null; }
   if(tinyPipe && largePipe) return;
   overlay.classList.add('show');
   try{
@@ -802,26 +840,44 @@ async function ensureModels(){
       overlayPct.textContent = '0%';
       tinyPipe = await pipeline('automatic-speech-recognition', TINY_MODEL, { progress_callback: modelProgress });
     }
-    if(!largePipe && navigator.gpu){
-      try{
-        overlayMsg.textContent = '確定版モデルを準備しています(large-v3-turbo / GPU)';
-        overlayPct.textContent = '0%';
-        largePipe = await pipeline('automatic-speech-recognition', TURBO_MODEL, {
-          device: 'webgpu',
-          dtype: { encoder_model: 'q4', decoder_model_merged: 'q4' },
-          progress_callback: modelProgress
-        });
-        finalModelLabel = 'large-v3-turbo';
-      }catch(e){
-        console.warn('turbo(webgpu) load failed -> fallback to small', e);
-        largePipe = null;
-      }
-    }
     if(!largePipe){
-      overlayMsg.textContent = '確定版モデルを準備しています(small)';
-      overlayPct.textContent = '0%';
-      largePipe = await pipeline('automatic-speech-recognition', FALLBACK_MODEL, { progress_callback: modelProgress });
-      finalModelLabel = 'small';
+      const choice = MODEL_CHOICES[prefKey];
+      if(choice.webgpu){
+        if(navigator.gpu){
+          try{
+            overlayMsg.textContent = `確定版モデルを準備しています(${choice.label} / GPU)`;
+            overlayPct.textContent = '0%';
+            largePipe = await pipeline('automatic-speech-recognition', choice.id, {
+              device: 'webgpu',
+              dtype: { encoder_model: 'q4', decoder_model_merged: 'q4' },
+              progress_callback: modelProgress
+            });
+            finalModelLabel = choice.label;
+            loadedFinalKey = prefKey;
+          }catch(e){
+            console.warn('webgpu model load failed -> fallback to small', e);
+            largePipe = null;
+          }
+        }
+      } else {
+        try{
+          overlayMsg.textContent = `確定版モデルを準備しています(${choice.label})`;
+          overlayPct.textContent = '0%';
+          largePipe = await pipeline('automatic-speech-recognition', choice.id, { progress_callback: modelProgress });
+          finalModelLabel = choice.label;
+          loadedFinalKey = prefKey;
+        }catch(e){
+          console.warn('model load failed -> fallback to small', e);
+          largePipe = null;
+        }
+      }
+      if(!largePipe){
+        overlayMsg.textContent = '確定版モデルを準備しています(small)';
+        overlayPct.textContent = '0%';
+        largePipe = await pipeline('automatic-speech-recognition', FALLBACK_MODEL, { progress_callback: modelProgress });
+        finalModelLabel = 'small';
+        loadedFinalKey = 'small';
+      }
     }
   } finally {
     overlay.classList.remove('show');
