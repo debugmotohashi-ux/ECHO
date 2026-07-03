@@ -59,6 +59,14 @@
     transition:all .2s ease;
   }
   .status-pill.rec{ background:var(--green-soft); color:var(--green-deep); }
+  .login-badge{
+    display:flex; align-items:center; gap:6px; font-size:11px; font-weight:700;
+    padding:6px 10px; border-radius:999px; cursor:pointer;
+    background:var(--navy-card-2); color:var(--text-on-navy-muted);
+  }
+  .login-badge i{ width:6px; height:6px; border-radius:50%; background:var(--text-on-navy-muted); display:inline-block; }
+  .login-badge.on{ background:var(--green-soft); color:var(--green-deep); }
+  .login-badge.on i{ background:var(--green-deep); }
   .icon-btn{
     width:32px; height:32px; border-radius:999px; border:none; cursor:pointer;
     background:var(--navy-card-2); color:var(--text-on-navy-muted);
@@ -237,6 +245,7 @@
       </div>
     </div>
     <div class="hero-right">
+      <div class="login-badge" id="loginBadge"><i></i><span id="loginBadgeText">未設定</span></div>
       <div class="status-pill" id="stamp">待機中</div>
       <button class="icon-btn" id="settingsBtn" aria-label="設定">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
@@ -353,7 +362,7 @@
 <div class="toast" id="toast"></div>
 
 <script type="module">
-import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.6.1/dist/transformers.min.js';
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
 env.allowLocalModels = false;
 
@@ -361,7 +370,8 @@ env.allowLocalModels = false;
 const SEGMENT_MS = 8000;          // realtime segment length
 const CHUNK_TARGET_SECONDS = 300; // 5 minutes per final chunk
 const TINY_MODEL = 'Xenova/whisper-tiny';
-const LARGE_MODEL = 'Xenova/whisper-large-v3-turbo';
+const TURBO_MODEL = 'onnx-community/whisper-large-v3-turbo';
+const FALLBACK_MODEL = 'Xenova/whisper-small';
 const RMS_SILENCE = 0.0045;       // below this = treated as silence for realtime
 const SB_TABLE = 'echo_captures';
 const DEVICE = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
@@ -431,6 +441,8 @@ const recoverCard = document.getElementById('recoverCard');
 const recoverInfo = document.getElementById('recoverInfo');
 const syncStatusEl = document.getElementById('syncStatus');
 const authStateEl = document.getElementById('authState');
+const loginBadgeEl = document.getElementById('loginBadge');
+const loginBadgeTextEl = document.getElementById('loginBadgeText');
 
 // VU bars
 for(let i=0;i<24;i++){ const s=document.createElement('span'); vuEl.appendChild(s); }
@@ -596,6 +608,8 @@ async function refreshSyncStatus(){
     syncStatusEl.className = 'sync-status';
     authStateEl.textContent = '未設定。SupabaseのURLとAnon Keyを保存してください。';
     authStateEl.className = 'auth-state';
+    loginBadgeTextEl.textContent = '未設定';
+    loginBadgeEl.className = 'login-badge';
     return;
   }
   const session = await getSession();
@@ -604,8 +618,12 @@ async function refreshSyncStatus(){
     syncStatusEl.className = 'sync-status warn';
     authStateEl.textContent = '接続情報は保存済み。ログインすると同期が始まります。';
     authStateEl.className = 'auth-state';
+    loginBadgeTextEl.textContent = '未ログイン';
+    loginBadgeEl.className = 'login-badge';
     return;
   }
+  loginBadgeTextEl.textContent = 'ログイン中';
+  loginBadgeEl.className = 'login-badge on';
   const all = await nexusGetAll();
   const unsynced = all.filter(r=>!r.synced).length;
   if(!navigator.onLine){
@@ -682,13 +700,15 @@ window.addEventListener('online', ()=> fullSync(false));
 
 // ---------- Settings sheet ----------
 const settingsModal = document.getElementById('settingsModal');
-document.getElementById('settingsBtn').addEventListener('click', ()=>{
+function openSettings(){
   const cfg = loadCfg();
   document.getElementById('sbUrl').value = (cfg && cfg.url) || '';
   document.getElementById('sbKey').value = (cfg && cfg.key) || '';
   refreshSyncStatus();
   settingsModal.classList.add('show');
-});
+}
+document.getElementById('settingsBtn').addEventListener('click', openSettings);
+loginBadgeEl.addEventListener('click', openSettings);
 document.getElementById('closeSettingsBtn').addEventListener('click', ()=> settingsModal.classList.remove('show'));
 settingsModal.addEventListener('click', (e)=>{ if(e.target === settingsModal) settingsModal.classList.remove('show'); });
 
@@ -769,25 +789,45 @@ function setFormatTabs(fmt){
 }
 
 // ---------- Model loading ----------
+let finalModelLabel = '';
+function modelProgress(p){
+  if(p.status==='progress'){ overlayPct.textContent = Math.round(p.progress||0)+'%'; }
+}
 async function ensureModels(){
   if(tinyPipe && largePipe) return;
   overlay.classList.add('show');
-  overlayMsg.textContent = '速報用モデルを準備しています(tiny)';
-  tinyPipe = await pipeline('automatic-speech-recognition', TINY_MODEL, {
-    progress_callback: (p)=>{
-      if(p.status==='progress'){ overlayPct.textContent = Math.round(p.progress||0)+'%'; }
+  try{
+    if(!tinyPipe){
+      overlayMsg.textContent = '速報用モデルを準備しています(tiny)';
+      overlayPct.textContent = '0%';
+      tinyPipe = await pipeline('automatic-speech-recognition', TINY_MODEL, { progress_callback: modelProgress });
     }
-  });
-  overlayMsg.textContent = '確定版モデルを準備しています(large-v3-turbo)';
-  overlayPct.textContent = '0%';
-  largePipe = await pipeline('automatic-speech-recognition', LARGE_MODEL, {
-    progress_callback: (p)=>{
-      if(p.status==='progress'){ overlayPct.textContent = Math.round(p.progress||0)+'%'; }
+    if(!largePipe && navigator.gpu){
+      try{
+        overlayMsg.textContent = '確定版モデルを準備しています(large-v3-turbo / GPU)';
+        overlayPct.textContent = '0%';
+        largePipe = await pipeline('automatic-speech-recognition', TURBO_MODEL, {
+          device: 'webgpu',
+          dtype: { encoder_model: 'q4', decoder_model_merged: 'q4' },
+          progress_callback: modelProgress
+        });
+        finalModelLabel = 'large-v3-turbo';
+      }catch(e){
+        console.warn('turbo(webgpu) load failed -> fallback to small', e);
+        largePipe = null;
+      }
     }
-  });
-  overlay.classList.remove('show');
-  modelStatus.textContent = '準備完了';
-  setTimeout(()=>{ modelStatus.textContent='\u00A0'; }, 2500);
+    if(!largePipe){
+      overlayMsg.textContent = '確定版モデルを準備しています(small)';
+      overlayPct.textContent = '0%';
+      largePipe = await pipeline('automatic-speech-recognition', FALLBACK_MODEL, { progress_callback: modelProgress });
+      finalModelLabel = 'small';
+    }
+  } finally {
+    overlay.classList.remove('show');
+  }
+  modelStatus.textContent = `準備完了(${finalModelLabel})`;
+  setTimeout(()=>{ modelStatus.textContent='\u00A0'; }, 3000);
 }
 
 // ---------- Audio helpers ----------
@@ -874,7 +914,7 @@ async function transcribeFinal(pcm, segIds){
   }
   try{
     dotFinal.classList.add('on');
-    const result = await largePipe(pcm, { language:'japanese', task:'transcribe' });
+    const result = await largePipe(pcm, { language:'japanese', task:'transcribe', chunk_length_s: 30, stride_length_s: 5 });
     const text = cleanText(result.text || '');
     if(text){
       if(finalTextEl.classList.contains('empty')){
@@ -999,16 +1039,24 @@ async function completeSession(){
 // ---------- Record button ----------
 recBtn.addEventListener('click', async ()=>{
   if(!isRecording){
+    recBtn.disabled = true;
     try{
-      recBtn.disabled = true;
       stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+    }catch(err){
+      recBtn.disabled = false;
+      showToast('マイクの使用が許可されていません。ブラウザの設定を確認してください');
+      console.error(err);
+      return;
+    }
+    try{
       await ensureModels();
       recBtn.disabled = false;
     }catch(err){
       recBtn.disabled = false;
       overlay.classList.remove('show');
-      showToast('マイクまたはモデルの準備に失敗しました');
+      showToast('モデルの読み込みに失敗しました。Wi-Fi環境で再度お試しください');
       console.error(err);
+      if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
       return;
     }
     isRecording = true;
