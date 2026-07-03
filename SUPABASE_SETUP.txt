@@ -1,0 +1,47 @@
+ECHO — Supabase同期セットアップ手順
+=====================================
+
+■ 1. テーブル作成
+Supabaseダッシュボード → SQL Editor で以下を実行:
+
+create table echo_captures (
+  id text primary key,
+  ts timestamptz not null,
+  source text default 'ECHO',
+  layer text default 'capture',
+  type text default 'voice_transcript',
+  scope text default '',
+  format text default '',
+  duration_sec integer default 0,
+  text text default '',
+  device text default '',
+  created_at timestamptz default now()
+);
+
+alter table echo_captures enable row level security;
+
+create policy "authenticated full access"
+  on echo_captures for all
+  to authenticated
+  using (true) with check (true);
+
+■ 2. ログインユーザー作成
+ダッシュボード → Authentication → Users → Add user
+→ 自分用のメールアドレスとパスワードを設定
+  (Auto Confirm User にチェックを入れると確認メール不要)
+
+■ 3. アプリ側の設定
+ECHOの右上の歯車アイコン → 
+  - Supabase URL(Settings → API の Project URL)
+  - Anon Key(同じ画面の anon public キー)
+  を入力して「接続情報を保存」
+→ 続けてメール・パスワードでログイン
+
+これで完了。以降は録音確定のたびに自動同期され、
+iPad・Androidでも同じ設定+ログインをすれば同じ記録が見られます。
+
+■ セキュリティについて
+- RLS(Row Level Security)有効のため、ログインしていない相手は
+  Anon Keyを知っていてもデータを読めません
+- 接続情報とログインセッションは各端末内にのみ保存されます
+  (ECHO.htmlファイル自体には埋め込まれないので、ファイルを人に渡しても安全です)
