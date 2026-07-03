@@ -274,7 +274,6 @@
 
   <div class="hero-progress-bar"><i id="progressBar"></i></div>
   <div class="hero-legend">
-    <span><i class="leg-live"></i>速報</span>
     <span><i class="leg-final"></i>確定</span>
     <span class="sync-status" id="syncStatus">同期: 未設定</span>
   </div>
@@ -300,15 +299,11 @@
 
   <button class="rec-btn" id="recBtn">録音を開始</button>
   <div class="vu-card" id="vu"></div>
-
-  <div class="card">
-    <h3><span>速報(リアルタイム)</span><span class="dot" id="dotLive"></span></h3>
-    <div class="body empty" id="liveText">録音を開始すると、ここに速報の文字起こしが流れます。</div>
-  </div>
+  <div id="liveText" style="display:none"></div>
 
   <div class="card">
     <h3><span>確定版(高精度)</span><span class="dot" id="dotFinal"></span></h3>
-    <div class="body empty" id="finalText">確定した文字起こしはこちらに追記されます。</div>
+    <div class="body empty" id="finalText">確定した文字起こしはこちらに追記されます。文字起こしには数分かかることがあります。</div>
   </div>
 
   <button class="bridge-btn" id="bridgeBtn" disabled>ChatGPTへ(コピー＋起動)</button>
@@ -334,10 +329,9 @@
       <select id="modelSelect">
         <option value="base">軽量(base・約150MB)</option>
         <option value="small">標準(small・約250MB / 推奨)</option>
-        <option value="medium">高精度(medium・約800MB)</option>
-        <option value="turbo">最高精度(large-v3-turbo・GPU / ハイエンド端末向け)</option>
+        <option value="medium">高精度(medium・約800MB / メモリに余裕のある端末向け)</option>
       </select>
-      <div class="field-hint">アプリやブラウザが落ちる場合は軽いモデルを選んでください。変更は次回の録音開始時に反映されます。iPhoneは「標準」推奨です。</div>
+      <div class="field-hint">アプリやブラウザが落ちる場合は軽いモデルを選んでください。変更は次回の録音開始時に反映されます。</div>
     </div>
 
     <div class="sheet-divider"></div>
@@ -381,27 +375,28 @@
 <div class="toast" id="toast"></div>
 
 <script type="module">
-import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.6.1/dist/transformers.min.js';
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
 env.allowLocalModels = false;
+
+// ---------- crash-point diagnostics ----------
+function stage(s){ try{ localStorage.setItem('echo_stage', s); }catch(e){} }
+function clearStage(){ try{ localStorage.removeItem('echo_stage'); }catch(e){} }
+window.addEventListener('pagehide', clearStage);
 
 // ---------- Config ----------
 const SEGMENT_MS = 8000;          // realtime segment length
 const CHUNK_TARGET_SECONDS = 300; // 5 minutes per final chunk
-const TINY_MODEL = 'Xenova/whisper-tiny';
-const TURBO_MODEL = 'onnx-community/whisper-large-v3-turbo';
 const FALLBACK_MODEL = 'Xenova/whisper-small';
 const MODEL_CHOICES = {
   base:  { id: 'Xenova/whisper-base',   label: 'base' },
   small: { id: 'Xenova/whisper-small',  label: 'small' },
-  medium:{ id: 'Xenova/whisper-medium', label: 'medium' },
-  turbo: { id: TURBO_MODEL, label: 'large-v3-turbo', webgpu: true }
+  medium:{ id: 'Xenova/whisper-medium', label: 'medium' }
 };
 function getModelPref(){
   const v = localStorage.getItem('echo_model_pref');
   return MODEL_CHOICES[v] ? v : 'small';
 }
-const RMS_SILENCE = 0.0045;       // below this = treated as silence for realtime
 const SB_TABLE = 'echo_captures';
 const DEVICE = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
 
@@ -423,17 +418,12 @@ function cleanText(t){
   JUNK_PATTERNS.forEach(p => { s = s.replace(p, ''); });
   return s.trim();
 }
-function rms(pcm){
-  let sum = 0, n = 0;
-  for(let i = 0; i < pcm.length; i += 16){ sum += pcm[i]*pcm[i]; n++; }
-  return n ? Math.sqrt(sum/n) : 0;
-}
 
 // ---------- State ----------
 let currentFormat = '面談';
 let isRecording = false;
 let stream = null;
-let tinyPipe = null, largePipe = null;
+let largePipe = null;
 let totalSeconds = 0, confirmedSeconds = 0;
 let bufferChunks = []; // [{pcm, segId}]
 let bufferedSeconds = 0;
@@ -457,7 +447,6 @@ const vuEl = document.getElementById('vu');
 const progressText = document.getElementById('progressText');
 const progressBar = document.getElementById('progressBar');
 const modelStatus = document.getElementById('modelStatus');
-const dotLive = document.getElementById('dotLive');
 const dotFinal = document.getElementById('dotFinal');
 const bridgeBtn = document.getElementById('bridgeBtn');
 const overlay = document.getElementById('overlay');
@@ -832,56 +821,33 @@ function modelProgress(p){
 async function ensureModels(){
   const prefKey = getModelPref();
   if(largePipe && loadedFinalKey !== prefKey && !isRecording){ largePipe = null; }
-  if(tinyPipe && largePipe) return;
+  if(largePipe) return;
   overlay.classList.add('show');
   try{
-    if(!tinyPipe){
-      overlayMsg.textContent = '速報用モデルを準備しています(tiny)';
+    const choice = MODEL_CHOICES[prefKey];
+    try{
+      stage(`確定モデル(${choice.label})の読み込み`);
+      overlayMsg.textContent = `モデルを準備しています(${choice.label})`;
       overlayPct.textContent = '0%';
-      tinyPipe = await pipeline('automatic-speech-recognition', TINY_MODEL, { progress_callback: modelProgress });
+      largePipe = await pipeline('automatic-speech-recognition', choice.id, { progress_callback: modelProgress });
+      finalModelLabel = choice.label;
+      loadedFinalKey = prefKey;
+    }catch(e){
+      console.warn('model load failed -> fallback to small', e);
+      largePipe = null;
     }
     if(!largePipe){
-      const choice = MODEL_CHOICES[prefKey];
-      if(choice.webgpu){
-        if(navigator.gpu){
-          try{
-            overlayMsg.textContent = `確定版モデルを準備しています(${choice.label} / GPU)`;
-            overlayPct.textContent = '0%';
-            largePipe = await pipeline('automatic-speech-recognition', choice.id, {
-              device: 'webgpu',
-              dtype: { encoder_model: 'q4', decoder_model_merged: 'q4' },
-              progress_callback: modelProgress
-            });
-            finalModelLabel = choice.label;
-            loadedFinalKey = prefKey;
-          }catch(e){
-            console.warn('webgpu model load failed -> fallback to small', e);
-            largePipe = null;
-          }
-        }
-      } else {
-        try{
-          overlayMsg.textContent = `確定版モデルを準備しています(${choice.label})`;
-          overlayPct.textContent = '0%';
-          largePipe = await pipeline('automatic-speech-recognition', choice.id, { progress_callback: modelProgress });
-          finalModelLabel = choice.label;
-          loadedFinalKey = prefKey;
-        }catch(e){
-          console.warn('model load failed -> fallback to small', e);
-          largePipe = null;
-        }
-      }
-      if(!largePipe){
-        overlayMsg.textContent = '確定版モデルを準備しています(small)';
-        overlayPct.textContent = '0%';
-        largePipe = await pipeline('automatic-speech-recognition', FALLBACK_MODEL, { progress_callback: modelProgress });
-        finalModelLabel = 'small';
-        loadedFinalKey = 'small';
-      }
+      stage('確定モデル(small)の読み込み');
+      overlayMsg.textContent = 'モデルを準備しています(small)';
+      overlayPct.textContent = '0%';
+      largePipe = await pipeline('automatic-speech-recognition', FALLBACK_MODEL, { progress_callback: modelProgress });
+      finalModelLabel = 'small';
+      loadedFinalKey = 'small';
     }
   } finally {
     overlay.classList.remove('show');
   }
+  stage('モデル準備完了');
   modelStatus.textContent = `準備完了(${finalModelLabel})`;
   setTimeout(()=>{ modelStatus.textContent='\u00A0'; }, 3000);
 }
@@ -905,15 +871,15 @@ function recordSegment(ms){
     setTimeout(()=>{ if(rec.state !== 'inactive') rec.stop(); }, ms);
   });
 }
+let decodeCtx = null;
 async function decodeToMono16k(blob){
   if(!blob || blob.size === 0) return new Float32Array(0);
   const arrayBuffer = await blob.arrayBuffer();
-  const tempCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if(!decodeCtx){ decodeCtx = new (window.AudioContext || window.webkitAudioContext)(); }
   let decoded;
   try{
-    decoded = await tempCtx.decodeAudioData(arrayBuffer);
+    decoded = await decodeCtx.decodeAudioData(arrayBuffer);
   }catch(err){
-    tempCtx.close();
     return new Float32Array(0);
   }
   const offlineCtx = new OfflineAudioContext(1, Math.ceil(decoded.duration*16000)+1, 16000);
@@ -922,7 +888,6 @@ async function decodeToMono16k(blob){
   src.connect(offlineCtx.destination);
   src.start();
   const rendered = await offlineCtx.startRendering();
-  tempCtx.close();
   return rendered.getChannelData(0);
 }
 function concatFloat32(arrays){
@@ -935,29 +900,6 @@ function concatFloat32(arrays){
 }
 
 // ---------- Transcription ----------
-async function transcribeRealtime(pcm){
-  if(pcm.length < 1600) return;
-  if(rms(pcm) < RMS_SILENCE) return; // silence: skip (battery + hallucination guard)
-  try{
-    dotLive.classList.add('on');
-    const result = await tinyPipe(pcm, { language:'japanese', task:'transcribe' });
-    const text = cleanText(result.text || '');
-    if(text){
-      if(liveTextEl.classList.contains('empty')){
-        liveTextEl.classList.remove('empty');
-        liveTextEl.textContent = '';
-      }
-      liveTextEl.textContent += (liveTextEl.textContent ? ' ' : '') + text;
-      liveTextEl.scrollTop = liveTextEl.scrollHeight;
-      saveSessionMeta();
-    }
-  }catch(err){
-    console.error('realtime transcribe error', err);
-  }finally{
-    dotLive.classList.remove('on');
-  }
-}
-
 function queueFinalChunk(pcm, segIds){
   largeQueue = largeQueue.then(()=> transcribeFinal(pcm, segIds));
   return largeQueue;
@@ -970,6 +912,7 @@ async function transcribeFinal(pcm, segIds){
   }
   try{
     dotFinal.classList.add('on');
+    stage(`確定処理中(${finalModelLabel})`);
     const result = await largePipe(pcm, { language:'japanese', task:'transcribe', chunk_length_s: 30, stride_length_s: 5 });
     const text = cleanText(result.text || '');
     if(text){
@@ -1030,6 +973,7 @@ function stopVu(){
 
 // ---------- Main recording loop ----------
 async function mainLoop(){
+  stage('録音中');
   while(isRecording){
     const segBlob = await recordSegment(SEGMENT_MS);
     // persist raw segment first (crash protection)
@@ -1046,7 +990,6 @@ async function mainLoop(){
     updateProgressUI();
     saveSessionMeta();
     if(!isRecording) break;
-    transcribeRealtime(pcm); // fire and forget
     if(bufferedSeconds >= CHUNK_TARGET_SECONDS){
       finalizeBufferedChunk();
     }
@@ -1090,6 +1033,7 @@ async function completeSession(){
     fullSync(false); // background sync
   }
   if(currentSession){ await deleteSessionData(currentSession.id); currentSession = null; }
+  clearStage();
 }
 
 // ---------- Record button ----------
@@ -1300,6 +1244,12 @@ async function renderHistory(){
 }
 
 // ---------- Init ----------
+const lastStage = localStorage.getItem('echo_stage');
+if(lastStage){
+  console.warn('previous run ended during:', lastStage);
+  setTimeout(()=> showToast(`前回は「${lastStage}」の途中で強制終了した可能性があります`), 900);
+  localStorage.removeItem('echo_stage');
+}
 updateProgressUI();
 openDB().then(()=>{ checkRecovery(); }).catch(e=> console.warn('idb open failed', e));
 (async ()=>{
