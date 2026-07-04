@@ -1226,6 +1226,7 @@ function stopVu(){
 let silenceWarned = false;
 async function mainLoop(){
   stage('録音中');
+  let reacquired = false;
   while(isRecording){
     const segBlob = await recordSegment(SEGMENT_MS);
     // persist raw segment first (crash protection)
@@ -1236,7 +1237,25 @@ async function mainLoop(){
     }catch(e){ console.warn('segment persist failed', e); }
     const pcm = await decodeToMono16k(segBlob);
     if(pcm.length === 0){
-      if(!silenceWarned && segBlob.size > 0){
+      if(segBlob.size === 0){
+        // mic delivered nothing — one silent self-heal: re-acquire the stream
+        if(isRecording && !reacquired){
+          reacquired = true;
+          try{
+            const old = stream;
+            stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+            if(old) old.getTracks().forEach(t=>t.stop());
+            stopVu();
+            startVu();
+            showToast('マイクを再接続しました');
+            continue;
+          }catch(e){ console.warn('mic reacquire failed', e); }
+        }
+        if(!silenceWarned){
+          silenceWarned = true;
+          showToast('⚠️ マイクからデータが届いていません。端末のマイク設定を確認してください');
+        }
+      } else if(!silenceWarned){
         silenceWarned = true;
         showToast('⚠️ 録音データを解析できませんでした(録音形式が非対応の可能性)');
       }
@@ -1307,6 +1326,18 @@ recBtn.addEventListener('click', async ()=>{
   if(!isRecording){
     ensureAudioCtx(); // must run synchronously within the tap (autoplay policy)
     recBtn.disabled = true;
+    // 1) Load the model FIRST. Holding the mic idle through a long model load
+    //    lets Android reclaim/mute the track — the cause of silent recordings.
+    try{
+      await ensureModels();
+    }catch(err){
+      recBtn.disabled = false;
+      overlay.classList.remove('show');
+      showToast('モデルの読み込みに失敗しました。Wi-Fi環境で再度お試しください');
+      console.error(err);
+      return;
+    }
+    // 2) Grab the mic immediately before use (same pattern as the proven mic test)
     try{
       stream = await navigator.mediaDevices.getUserMedia({ audio:true });
     }catch(err){
@@ -1320,28 +1351,11 @@ recBtn.addEventListener('click', async ()=>{
       if(micTrack.muted){
         showToast('⚠️ マイクがOS側でブロックされています。端末のマイク設定を確認してください');
       }
-      micTrack.addEventListener('mute', ()=>{
-        showToast('⚠️ マイクがOSまたは他アプリによってミュートされました');
-      });
-      micTrack.addEventListener('unmute', ()=>{
-        showToast('マイクが復帰しました');
-      });
+      micTrack.addEventListener('mute', ()=> showToast('⚠️ マイクがOSまたは他アプリによってミュートされました'));
+      micTrack.addEventListener('unmute', ()=> showToast('マイクが復帰しました'));
+      micTrack.addEventListener('ended', ()=> showToast('⚠️ マイクが切断されました'));
     }
-    try{
-      await ensureModels();
-      recBtn.disabled = false;
-    }catch(err){
-      recBtn.disabled = false;
-      overlay.classList.remove('show');
-      showToast('モデルの読み込みに失敗しました。Wi-Fi環境で再度お試しください');
-      console.error(err);
-      if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
-      return;
-    }
-    // model loading can take a while — re-verify the mic wasn't muted meanwhile
-    if(micTrack && micTrack.muted){
-      showToast('⚠️ マイクがミュート状態です。他アプリの使用状況や端末設定を確認してください');
-    }
+    recBtn.disabled = false;
     isRecording = true;
     recoverCard.style.display = 'none';
     finalTextValue = '';
