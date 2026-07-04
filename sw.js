@@ -7,7 +7,7 @@
 //    so the app can boot offline. Model files (HuggingFace) are cached by transformers.js itself.
 //  - Everything else (Supabase API, HuggingFace, ChatGPT): straight to network, never cached.
 
-const CACHE = 'echo-shell-v1';
+const CACHE = 'echo-shell-v2';
 const PRECACHE = [
   './',
   './index.html',

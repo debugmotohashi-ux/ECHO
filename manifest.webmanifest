@@ -7,10 +7,34 @@
   "orientation": "portrait",
   "background_color": "#0E1520",
   "theme_color": "#0E1520",
-  "description": "録音から高精度文字起こしまで端末内で完結するボイスキャプチャ",
+  "description": "面談・教育の文字起こしを整形・共有・同期するハブ",
   "icons": [
-    { "src": "./icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
-    { "src": "./icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "./icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
-  ]
+    {
+      "src": "./icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "share_target": {
+    "action": "./",
+    "method": "GET",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url"
+    }
+  }
 }
