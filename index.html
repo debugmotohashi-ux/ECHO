@@ -583,7 +583,7 @@ let activeRecorder = null;
 let mainLoopPromise = null;
 let diag = null;
 function resetDiag(){
-  diag = { segments:0, bytes:0, decodedSec:0, maxRms:0, emptyBlobs:0, decodeFails:0, whisperEmpty:0, gatedSilent:0 };
+  diag = { segments:0, bytes:0, decodedSec:0, maxRms:0, emptyBlobs:0, decodeFails:0, whisperEmpty:0, gatedSilent:0, errors:0, lastError:'' };
 }
 resetDiag();
 let totalSeconds = 0, confirmedSeconds = 0;
@@ -1169,7 +1169,14 @@ async function transcribeFinal(pcm, segIds){
   try{
     dotFinal.classList.add('on');
     stage(`確定処理中(${finalModelLabel})`);
-    const result = await largePipe(pcm, { language:'japanese', task:'transcribe', chunk_length_s: 30, stride_length_s: 5 });
+    // Short audio (<30s) goes through Whisper's native single-window path;
+    // the chunked path is only needed (and only safe) for longer audio.
+    const opts = { language:'japanese', task:'transcribe' };
+    if(pcm.length > 30*16000){
+      opts.chunk_length_s = 30;
+      opts.stride_length_s = 5;
+    }
+    const result = await largePipe(pcm, opts);
     const text = collapseRepeats(cleanText(result.text || ''));
     if(text){
       if(finalTextEl.classList.contains('empty')){
@@ -1185,6 +1192,9 @@ async function transcribeFinal(pcm, segIds){
     }
   }catch(err){
     console.error('final transcribe error', err);
+    diag.errors++;
+    diag.lastError = String((err && err.message) || err).slice(0, 200);
+    showToast('⚠️ 文字起こし処理でエラーが発生しました');
   }finally{
     dotFinal.classList.remove('on');
     confirmedSeconds += pcm.length/16000;
@@ -1335,6 +1345,7 @@ async function completeSession(){
     fullSync(false); // background sync
   } else if(currentSession){
     const verdict =
+      diag.errors > 0 ? `文字起こし処理でエラーが発生しました:\n${diag.lastError}` :
       diag.segments === 0 ? '録音セグメントが生成されませんでした' :
       diag.emptyBlobs === diag.segments ? 'マイクからデータが届いていません(全セグメント0バイト)' :
       (diag.decodeFails > 0 && diag.decodedSec === 0) ? '録音データの解析(デコード)に失敗しました' :
