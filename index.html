@@ -339,6 +339,15 @@
 
     <div class="sheet-divider"></div>
 
+    <div class="field">
+      <label>マイクテスト(録音経路の診断)</label>
+      <button class="sheet-btn ghost" id="micTestBtn" style="margin-bottom:8px;">3秒録音してテスト</button>
+      <div class="field-hint" id="micTestResult" style="white-space:pre-line;">録音→解析→再生までの経路を診断します。テスト中は端末に話しかけてください。</div>
+      <audio id="micTestAudio" controls style="width:100%; display:none; margin-top:8px;"></audio>
+    </div>
+
+    <div class="sheet-divider"></div>
+
     <div class="auth-state" id="authState">未設定</div>
 
     <div class="field">
@@ -911,6 +920,80 @@ document.getElementById('logoutBtn').addEventListener('click', async ()=>{
 });
 document.getElementById('syncNowBtn').addEventListener('click', ()=> fullSync(true));
 
+// ---------- Mic test (records 3s, probes every layer of the audio path) ----------
+const micTestBtn = document.getElementById('micTestBtn');
+const micTestResult = document.getElementById('micTestResult');
+const micTestAudio = document.getElementById('micTestAudio');
+micTestBtn.addEventListener('click', async ()=>{
+  if(isRecording){ showToast('録音中はテストできません'); return; }
+  micTestBtn.disabled = true;
+  micTestAudio.style.display = 'none';
+  micTestResult.textContent = 'マイク取得中…';
+  const ctx = ensureAudioCtx();
+  let testStream = null;
+  try{
+    testStream = await navigator.mediaDevices.getUserMedia({ audio:true });
+  }catch(err){
+    micTestResult.textContent = '✗ マイク取得に失敗: ' + (err && err.name ? err.name : err) + '\nブラウザ/OSのマイク権限を確認してください';
+    micTestBtn.disabled = false;
+    return;
+  }
+  const track = testStream.getAudioTracks()[0];
+  const trackInfo = track
+    ? `デバイス: ${track.label || '(名称なし)'} / muted: ${track.muted} / state: ${track.readyState}`
+    : 'トラックなし';
+  // WebAudio-level probe (independent of MediaRecorder)
+  const src = ctx.createMediaStreamSource(testStream);
+  const an = ctx.createAnalyser();
+  an.fftSize = 2048;
+  src.connect(an);
+  const buf = new Float32Array(an.fftSize);
+  let peakLevel = 0;
+  const levelTimer = setInterval(()=>{
+    an.getFloatTimeDomainData(buf);
+    let s = 0;
+    for(let i=0;i<buf.length;i+=8){ s += buf[i]*buf[i]; }
+    const level = Math.sqrt(s/(buf.length/8));
+    if(level > peakLevel) peakLevel = level;
+    micTestResult.textContent = `録音中…話しかけてください\nWebAudioレベル: ${level.toFixed(4)}(ピーク ${peakLevel.toFixed(4)})\n${trackInfo}`;
+  }, 120);
+  let blob;
+  try{
+    blob = await new Promise((resolve)=>{
+      const mt = pickMimeType();
+      const rec = new MediaRecorder(testStream, mt ? {mimeType: mt} : undefined);
+      const chunks = [];
+      rec.ondataavailable = (e)=>{ if(e.data && e.data.size>0) chunks.push(e.data); };
+      rec.onstop = ()=> resolve(new Blob(chunks, {type: rec.mimeType || 'audio/webm'}));
+      rec.start();
+      setTimeout(()=>{ if(rec.state !== 'inactive') rec.stop(); }, 3000);
+    });
+  } finally {
+    clearInterval(levelTimer);
+    try{ src.disconnect(); }catch(e){}
+    testStream.getTracks().forEach(t=>t.stop());
+  }
+  const pcm = await decodeToMono16k(blob);
+  const level = pcm.length ? rms(pcm) : 0;
+  let verdict;
+  if(blob.size === 0){
+    verdict = '✗ 録音データが0バイト。マイク入力がOS/端末レベルで遮断されています';
+  } else if(pcm.length === 0){
+    verdict = '✗ 録音はされましたが解析(デコード)に失敗。形式非対応の可能性';
+  } else if(level < RMS_SILENCE){
+    verdict = `△ 録音はされましたがほぼ無音です(レベル ${level.toFixed(4)})`;
+  } else {
+    verdict = `○ 正常に録音できています(レベル ${level.toFixed(4)})`;
+  }
+  micTestResult.textContent =
+    `${verdict}\n形式: ${blob.type || '不明'} / サイズ: ${blob.size}バイト / 長さ: ${(pcm.length/16000).toFixed(1)}秒\nWebAudioピーク: ${peakLevel.toFixed(4)}\n${trackInfo}\n下の再生ボタンで自分の声が聞こえるか確認してください`;
+  if(blob.size > 0){
+    micTestAudio.src = URL.createObjectURL(blob);
+    micTestAudio.style.display = 'block';
+  }
+  micTestBtn.disabled = false;
+});
+
 // ---------- Wake Lock (screen sleep prevention) ----------
 async function acquireWakeLock(){
   try{
@@ -1238,7 +1321,10 @@ recBtn.addEventListener('click', async ()=>{
         showToast('⚠️ マイクがOS側でブロックされています。端末のマイク設定を確認してください');
       }
       micTrack.addEventListener('mute', ()=>{
-        if(isRecording) showToast('⚠️ マイクがOSまたは他アプリによってミュートされました');
+        showToast('⚠️ マイクがOSまたは他アプリによってミュートされました');
+      });
+      micTrack.addEventListener('unmute', ()=>{
+        showToast('マイクが復帰しました');
       });
     }
     try{
@@ -1251,6 +1337,10 @@ recBtn.addEventListener('click', async ()=>{
       console.error(err);
       if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
       return;
+    }
+    // model loading can take a while — re-verify the mic wasn't muted meanwhile
+    if(micTrack && micTrack.muted){
+      showToast('⚠️ マイクがミュート状態です。他アプリの使用状況や端末設定を確認してください');
     }
     isRecording = true;
     recoverCard.style.display = 'none';
