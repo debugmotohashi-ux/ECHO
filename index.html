@@ -1157,6 +1157,17 @@ function queueFinalChunk(pcm, segIds){
   return largeQueue;
 }
 
+async function runWhisper(pcm){
+  // Short audio (<30s) goes through Whisper's native single-window path;
+  // the chunked path is only needed for longer audio.
+  const opts = { language:'japanese', task:'transcribe' };
+  if(pcm.length > 30*16000){
+    opts.chunk_length_s = 30;
+    opts.stride_length_s = 5;
+  }
+  return largePipe(pcm, opts);
+}
+
 async function transcribeFinal(pcm, segIds){
   if(pcm.length < 1600 || rms(pcm) < RMS_GATE){
     diag.gatedSilent++;
@@ -1169,14 +1180,23 @@ async function transcribeFinal(pcm, segIds){
   try{
     dotFinal.classList.add('on');
     stage(`確定処理中(${finalModelLabel})`);
-    // Short audio (<30s) goes through Whisper's native single-window path;
-    // the chunked path is only needed (and only safe) for longer audio.
-    const opts = { language:'japanese', task:'transcribe' };
-    if(pcm.length > 30*16000){
-      opts.chunk_length_s = 30;
-      opts.stride_length_s = 5;
+    let result;
+    try{
+      result = await runWhisper(pcm);
+    }catch(err){
+      // OrtRun error code 6 = WASM out-of-memory → downgrade one step and retry the same audio
+      const msg = String((err && err.message) || err);
+      const downgrade = /OrtRun/i.test(msg) ? ({medium:'small', small:'base'})[loadedFinalKey] : null;
+      if(!downgrade) throw err;
+      console.warn('OOM suspected — downgrading model to', downgrade, err);
+      showToast(`⚠️ メモリ不足のため「${downgrade}」モデルに切り替えて再試行します`);
+      localStorage.setItem('echo_model_pref', downgrade);
+      largePipe = null;
+      loadedFinalKey = null;
+      await ensureModels();
+      stage(`確定処理中(${finalModelLabel})`);
+      result = await runWhisper(pcm); // a second failure propagates to the outer catch
     }
-    const result = await largePipe(pcm, opts);
     const text = collapseRepeats(cleanText(result.text || ''));
     if(text){
       if(finalTextEl.classList.contains('empty')){
@@ -1354,7 +1374,7 @@ async function completeSession(){
       '原因を特定できませんでした';
     finalTextEl.classList.remove('empty');
     finalTextEl.textContent =
-      `文字起こしできる音声がありませんでした。\n\n[診断]\n判定: ${verdict}\n録音: ${diag.decodedSec.toFixed(1)}秒 / データ: ${(diag.bytes/1024).toFixed(0)}KB\nセグメント: ${diag.segments}件(空 ${diag.emptyBlobs} / 解析失敗 ${diag.decodeFails} / 無音スキップ ${diag.gatedSilent})\n最大音量レベル: ${diag.maxRms.toFixed(4)}`;
+      `文字起こしできる音声がありませんでした。\n\n[診断]\n判定: ${verdict}\nモデル: ${finalModelLabel || '(未ロード)'}\n録音: ${diag.decodedSec.toFixed(1)}秒 / データ: ${(diag.bytes/1024).toFixed(0)}KB\nセグメント: ${diag.segments}件(空 ${diag.emptyBlobs} / 解析失敗 ${diag.decodeFails} / 無音スキップ ${diag.gatedSilent})\n最大音量レベル: ${diag.maxRms.toFixed(4)}`;
     showToast('文字起こしできる音声がありませんでした');
   }
   if(currentSession){ await deleteSessionData(currentSession.id); currentSession = null; }
