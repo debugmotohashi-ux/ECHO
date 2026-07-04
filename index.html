@@ -385,7 +385,7 @@ function clearStage(){ try{ localStorage.removeItem('echo_stage'); }catch(e){} }
 window.addEventListener('pagehide', clearStage);
 
 // ---------- Config ----------
-const SEGMENT_MS = 8000;          // realtime segment length
+const SEGMENT_MS = 20000;         // segment length (fewer boundaries = fewer clipped words)
 const CHUNK_TARGET_SECONDS = 300; // 5 minutes per final chunk
 const FALLBACK_MODEL = 'Xenova/whisper-small';
 const MODEL_CHOICES = {
@@ -401,8 +401,108 @@ const SB_TABLE = 'echo_captures';
 const DEVICE = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
 
 const PROMPTS = {
-  '面談': '以下は面談の文字起こしです。【面談内容共有】フォーマット(@All【面談内容共有】)で、事実→気づき→次のアクションが伝わるように整形してください。誤字脱字や言い淀みは自然に整えてください。\n\n---\n\n',
-  '教育': '以下は教育指導の文字起こしです。【教育の共有】フォーマットで、要点→気づき→再現性のポイントが伝わるように整形してください。誤字脱字や言い淀みは自然に整えてください。\n\n---\n\n',
+  '面談': `## Skillテンプレート(本橋式 面談共有作成)
+あなたは本橋式の面談共有作成アシスタントです。
+
+末尾の面談の文字起こしをもとに、社内共有用の面談内容共有を作成してください。
+
+本橋式では、本人を否定せず現状把握を重視し、強みを必ず見つけ、課題は事実ベースで整理し、今後の育成方針まで明確にすることを重視します。
+
+文体は上層部にも共有できる丁寧さを保ちつつ、本橋らしい自然な言葉遣いで作成してください。
+
+【出力形式】
+
+@All 【面談内容共有】
+
+対象者：
+面談者：本橋
+実施日：
+実施時間：
+実施場所：
+
+■面談目的
+
+■現状
+
+■強み
+
+■課題
+
+■本人へ伝えた内容
+
+■今後の方針
+
+■次回確認事項
+
+■反応
+
+■総評
+
+【元テキスト(面談の文字起こし)】
+
+---
+
+`,
+  '教育': `以下の内容をもとに、教育共有文を作成してください。
+
+目的は、教育内容を上長・関係者に共有するためです。
+文体は、硬すぎず、ただし軽すぎない「教育共有として見やすい文章」にしてください。
+内容は省略せず、伝わりやすいように整理してください。
+
+【作成ルール】
+・下記フォーマットを必ず使用する
+・見出しは変えない
+・内容は箇条書き中心で見やすく整理する
+・教育の意図、指導内容、対象者の反応、今後の課題が伝わるようにする
+・AIっぽく硬すぎる表現は避ける
+・現場感が伝わる自然な文章にする
+・「〜してます」「〜確認してます」「〜共有してます」など、本橋さんの共有文に近い言い回しを使う
+・必要に応じて、内容を①②③のように項目分けする
+・反応欄は、できている点と今後の課題が両方伝わるようにまとめる
+
+【フォーマット】
+
+【教育共有】
+
+■実施日
+〇月〇日(〇)
+
+■実施者
+〇〇
+
+■対象
+〇〇さん／〇〇くん
+
+■テーマ
+〇〇
+
+■目的
+・〇〇
+・〇〇
+・〇〇
+
+■内容
+①〇〇
+本文
+
+②〇〇
+本文
+
+③〇〇
+本文
+
+※内容に応じて項目数は増減してOKです。
+
+■反応
+本文
+
+対象者の理解度、良かった点、まだ課題として残っている点、今後反復が必要な部分を整理してください。
+
+【元情報(教育内容の文字起こし)】
+
+---
+
+`,
   'その他': '以下の文字起こしを、誤字脱字や言い淀みを整えて読みやすく整形してください。特定のフォーマット指定はありません。\n\n---\n\n'
 };
 
@@ -418,12 +518,56 @@ function cleanText(t){
   JUNK_PATTERNS.forEach(p => { s = s.replace(p, ''); });
   return s.trim();
 }
+function rms(pcm){
+  let sum = 0, n = 0;
+  for(let i = 0; i < pcm.length; i += 16){ sum += pcm[i]*pcm[i]; n++; }
+  return n ? Math.sqrt(sum/n) : 0;
+}
+const RMS_SILENCE = 0.003; // whole-chunk average below this = treated as silence, skip transcription
+// Whisper repetition-loop hallucination guard: detects a repeating block (period 1-4 sentences)
+// that repeats 3+ times consecutively and drops it — this is noise, not real speech.
+function collapseRepeats(text){
+  const parts = text.split(/(?<=[。！？!?])/).map(s=>s.trim()).filter(Boolean);
+  if(parts.length < 6) return text;
+  const out = [];
+  let i = 0, collapsedAny = false;
+  const maxPeriod = Math.min(4, Math.floor(parts.length/3));
+  while(i < parts.length){
+    let matchedPeriod = 0, matchedK = 0;
+    for(let p=1; p<=maxPeriod && i+p*2 <= parts.length; p++){
+      let k = 1;
+      while(i + (k+1)*p <= parts.length){
+        let same = true;
+        for(let o=0;o<p;o++){
+          if(parts[i+k*p+o] !== parts[i+(k-1)*p+o]){ same = false; break; }
+        }
+        if(!same) break;
+        k++;
+      }
+      if(k >= 3){ matchedPeriod = p; matchedK = k; break; }
+    }
+    if(matchedPeriod > 0){
+      collapsedAny = true;
+      i += matchedPeriod * matchedK; // drop the whole looped block
+    } else {
+      out.push(parts[i]);
+      i++;
+    }
+  }
+  let result = out.join(' ').trim();
+  if(collapsedAny && result.replace(/[。！？!?\s]/g,'').length < 4){
+    result = '[音声不明瞭のため一部認識できませんでした]';
+  }
+  return result;
+}
 
 // ---------- State ----------
 let currentFormat = '面談';
 let isRecording = false;
 let stream = null;
 let largePipe = null;
+let activeRecorder = null;
+let mainLoopPromise = null;
 let totalSeconds = 0, confirmedSeconds = 0;
 let bufferChunks = []; // [{pcm, segId}]
 let bufferedSeconds = 0;
@@ -864,9 +1008,13 @@ function recordSegment(ms){
   return new Promise((resolve)=>{
     const mimeType = pickMimeType();
     const rec = new MediaRecorder(stream, mimeType ? {mimeType} : undefined);
+    activeRecorder = rec;
     const chunks = [];
     rec.ondataavailable = (e)=>{ if(e.data && e.data.size>0) chunks.push(e.data); };
-    rec.onstop = ()=> resolve(new Blob(chunks, {type: rec.mimeType || 'audio/webm'}));
+    rec.onstop = ()=>{
+      if(activeRecorder === rec) activeRecorder = null;
+      resolve(new Blob(chunks, {type: rec.mimeType || 'audio/webm'}));
+    };
     rec.start();
     setTimeout(()=>{ if(rec.state !== 'inactive') rec.stop(); }, ms);
   });
@@ -906,15 +1054,18 @@ function queueFinalChunk(pcm, segIds){
 }
 
 async function transcribeFinal(pcm, segIds){
-  if(pcm.length < 1600){
+  if(pcm.length < 1600 || rms(pcm) < RMS_SILENCE){
     if(segIds && segIds.length) await deleteSegments(segIds);
+    confirmedSeconds += pcm.length/16000;
+    updateProgressUI();
+    saveSessionMeta();
     return;
   }
   try{
     dotFinal.classList.add('on');
     stage(`確定処理中(${finalModelLabel})`);
     const result = await largePipe(pcm, { language:'japanese', task:'transcribe', chunk_length_s: 30, stride_length_s: 5 });
-    const text = cleanText(result.text || '');
+    const text = collapseRepeats(cleanText(result.text || ''));
     if(text){
       if(finalTextEl.classList.contains('empty')){
         finalTextEl.classList.remove('empty');
@@ -923,7 +1074,7 @@ async function transcribeFinal(pcm, segIds){
       finalTextValue += (finalTextValue ? '\n' : '') + text;
       finalTextEl.textContent = finalTextValue;
       finalTextEl.scrollTop = finalTextEl.scrollHeight;
-      bridgeBtn.disabled = false;
+      if(!isRecording) bridgeBtn.disabled = false;
     }
   }catch(err){
     console.error('final transcribe error', err);
@@ -1014,6 +1165,7 @@ async function completeSession(){
   recBtn.classList.remove('recording');
   recBtn.disabled = false;
   releaseWakeLock();
+  bridgeBtn.disabled = !finalTextValue.trim();
   if(finalTextValue.trim() && currentSession){
     await nexusPut({
       id: 'echo_' + currentSession.id,
@@ -1031,6 +1183,8 @@ async function completeSession(){
     renderHistory();
     showToast('確定完了・保存しました');
     fullSync(false); // background sync
+  } else if(currentSession){
+    showToast('文字起こしできる音声がありませんでした');
   }
   if(currentSession){ await deleteSessionData(currentSession.id); currentSession = null; }
   clearStage();
@@ -1083,7 +1237,7 @@ recBtn.addEventListener('click', async ()=>{
     acquireWakeLock();
     startTimer();
     startVu();
-    mainLoop();
+    mainLoopPromise = mainLoop();
   } else {
     isRecording = false;
     recBtn.disabled = true;
@@ -1093,12 +1247,16 @@ recBtn.addEventListener('click', async ()=>{
     stampEl.classList.remove('rec');
     stampEl.textContent = '処理中';
     counterLabel.textContent = '確定処理中';
-    setTimeout(async ()=>{
+    if(activeRecorder && activeRecorder.state !== 'inactive'){
+      try{ activeRecorder.stop(); }catch(e){}
+    }
+    (async ()=>{
+      try{ if(mainLoopPromise) await mainLoopPromise; }catch(e){ console.warn('mainLoop error', e); }
       await finalizeBufferedChunk();
       await largeQueue;
       if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
       await completeSession();
-    }, SEGMENT_MS + 300);
+    })();
   }
 });
 
@@ -1167,18 +1325,16 @@ document.getElementById('recoverYes').addEventListener('click', async ()=>{
 });
 
 // ---------- ChatGPT bridge ----------
-bridgeBtn.addEventListener('click', async ()=>{
+bridgeBtn.addEventListener('click', ()=>{
   const text = finalTextValue || (liveTextEl.classList.contains('empty') ? '' : liveTextEl.textContent) || '';
   if(!text.trim()){ showToast('文字起こし結果がまだありません'); return; }
   const payload = PROMPTS[currentFormat] + text;
-  try{
-    await navigator.clipboard.writeText(payload);
-    showToast('コピーしました');
-  }catch(err){
-    showToast('コピーに失敗しました。手動で選択してください');
-  }
   const q = payload.length < 1500 ? ('?q=' + encodeURIComponent(payload)) : '';
+  // window.open must run synchronously within the tap gesture (Safari popup rules)
   window.open('https://chat.openai.com/' + q, '_blank');
+  navigator.clipboard.writeText(payload)
+    .then(()=> showToast('コピーしました。ChatGPTに貼り付けてください'))
+    .catch(()=> showToast('コピーに失敗しました。手動で選択してください'));
 });
 
 // ---------- JSON export ----------
@@ -1227,6 +1383,7 @@ async function renderHistory(){
   }).join('');
   panel.querySelectorAll('.history-item').forEach(el=>{
     el.addEventListener('click', async ()=>{
+      if(isRecording || recBtn.disabled){ showToast('録音・処理中は履歴を開けません'); return; }
       const id = el.dataset.id;
       const all = await nexusGetAll();
       const found = all.find(x=>x.id===id);
@@ -1265,4 +1422,3 @@ if(navigator.storage && navigator.storage.persist){ navigator.storage.persist().
 </script>
 </body>
 </html>
-
